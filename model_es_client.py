@@ -29,11 +29,18 @@ class ModelESClient:
             raise RuntimeError(f"Model ES server error at {path}: {data}")
         return data
 
-    def init(self, *, parameter_scope: str = "full", target_modules=None, verbose: bool = True):
-        data = self._post(
-            "/es/init",
-            {"parameter_scope": parameter_scope, "target_modules": target_modules, "verbose": verbose},
-        )
+    def init(
+        self,
+        *,
+        parameter_scope: str = "full",
+        target_modules=None,
+        scope_options=None,
+        verbose: bool = True,
+    ):
+        payload = {"parameter_scope": parameter_scope, "target_modules": target_modules, "verbose": verbose}
+        if scope_options:
+            payload["scope_options"] = scope_options
+        data = self._post("/es/init", payload)
         self._initialized = True
         return data
 

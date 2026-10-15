@@ -4,6 +4,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
+from .structured_es import STRUCTURED_SCOPES, StructuredES
+
 
 ParameterInfo = Tuple[str, int, torch.nn.Parameter]
 
@@ -19,6 +21,7 @@ class SeedReplayModelES:
     def __init__(self):
         self.parameter_infos: Optional[List[ParameterInfo]] = None
         self.parameter_scope: Optional[str] = None
+        self.structured: Optional[StructuredES] = None
         self.update_history: List[Dict[str, Any]] = []
         self.active_perturbation: Optional[Dict[str, Any]] = None
 
@@ -28,6 +31,7 @@ class SeedReplayModelES:
         *,
         parameter_scope: str = "full",
         target_modules: Optional[Iterable[str]] = None,
+        scope_options: Optional[Dict[str, Any]] = None,
         verbose: bool = True,
     ) -> Dict[str, Any]:
         previous_state_reset = None
@@ -36,27 +40,44 @@ class SeedReplayModelES:
             # a history on a reused server cannot stack updates from the prior run.
             previous_state_reset = self.reset()
         scope = self._normalize_parameter_scope(parameter_scope)
+        if scope_options and scope not in STRUCTURED_SCOPES:
+            raise ValueError(f"scope_options only apply to the scopes {STRUCTURED_SCOPES}, not {scope!r}.")
         if scope == "full":
             parameter_infos = self._gather_full_parameters(model)
-        elif scope == "all_linear":
-            parameter_infos = self._gather_linear_parameters(model, target_modules=target_modules)
-        else:
+        elif scope == "lora":
             parameter_infos = self._gather_lora_parameters(model)
+        else:
+            parameter_infos = self._gather_linear_parameters(model, target_modules=target_modules)
         if not parameter_infos:
             raise RuntimeError(f"No floating-point parameters selected for scope {scope!r}.")
 
+        # Drop the previous structured state before building a new one: it can
+        # hold a full fp32 copy of the weights.
+        self.structured = None
+        structured_info: Dict[str, Any] = {}
+        if scope in STRUCTURED_SCOPES:
+            self.structured = StructuredES(model, parameter_infos, scope=scope, options=scope_options)
+            parameter_infos = [
+                (state["name"], state["tensor_id"], state["parameter"]) for state in self.structured.states
+            ]
+            structured_info = self.structured.info()
         self.parameter_infos = parameter_infos
         self.parameter_scope = scope
         self.update_history = []
         self.active_perturbation = None
-        total_params = sum(parameter.numel() for _, _, parameter in parameter_infos)
+        total_params = structured_info.get(
+            "total_params", sum(parameter.numel() for _, _, parameter in parameter_infos)
+        )
         if verbose:
             print(f"[MODEL_ES] scope={scope}, tensors={len(parameter_infos)}, params={total_params:,}")
+            if structured_info:
+                print(f"[MODEL_ES] structured={structured_info}")
         return {
             "ok": True,
             "parameter_scope": scope,
             "n_tensors": len(parameter_infos),
             "total_params": int(total_params),
+            **structured_info,
             "previous_state_reset": previous_state_reset,
         }
 
@@ -70,7 +91,11 @@ class SeedReplayModelES:
             raise RuntimeError(
                 f"Cannot apply {requested}: perturbation {self.active_perturbation} is still active."
             )
-        self._apply_seeded_noise(self._require_initialized(), seed=seed, sigma=sigma)
+        parameter_infos = self._require_initialized()
+        if self.structured is not None:
+            self.structured.perturb(seed=seed, sigma=sigma)
+        else:
+            self._apply_seeded_noise(parameter_infos, seed=seed, sigma=sigma)
         self.active_perturbation = requested
         return {"ok": True, **requested, "already_applied": False}
 
@@ -84,7 +109,11 @@ class SeedReplayModelES:
             raise RuntimeError(
                 f"Cannot revert {requested}: active perturbation is {self.active_perturbation}."
             )
-        self._apply_seeded_noise(self._require_initialized(), seed=seed, sigma=-float(sigma))
+        parameter_infos = self._require_initialized()
+        if self.structured is not None:
+            self.structured.restore()
+        else:
+            self._apply_seeded_noise(parameter_infos, seed=seed, sigma=-float(sigma))
         self.active_perturbation = None
         return {"ok": True, **requested, "already_reverted": False}
 
@@ -122,7 +151,11 @@ class SeedReplayModelES:
             ddof=reward_normalization_ddof,
             eps=reward_normalization_eps,
         )
-        self._apply_dipu_update(parameter_infos, seeds=normalized_seeds, weights=weights, eta=float(alpha))
+        structured_metrics: Dict[str, float] = {}
+        if self.structured is not None:
+            structured_metrics = self.structured.update(seeds=normalized_seeds, weights=weights, eta=float(alpha))
+        else:
+            self._apply_dipu_update(parameter_infos, seeds=normalized_seeds, weights=weights, eta=float(alpha))
         self.update_history.append({"seeds": normalized_seeds, "weights": weights, "alpha": float(alpha)})
         weight_tensor = torch.tensor(weights, dtype=torch.float32)
         return {
@@ -134,11 +167,23 @@ class SeedReplayModelES:
             else 0.0,
             "reward_best": float(max(normalized_rewards)) if normalized_rewards else 0.0,
             "weight_norm": float(torch.linalg.norm(weight_tensor).item()) if weights else 0.0,
+            **structured_metrics,
         }
 
     def reset(self) -> Dict[str, Any]:
         parameter_infos = self._require_initialized()
         reverted_perturbation = self.active_perturbation
+        n_updates = len(self.update_history)
+        if self.structured is not None:
+            # Rendering from the reset state also clears any active perturbation.
+            self.structured.reset()
+            self.active_perturbation = None
+            self.update_history = []
+            return {
+                "ok": True,
+                "reverted_updates": n_updates,
+                "reverted_perturbation": reverted_perturbation,
+            }
         if reverted_perturbation is not None:
             self._apply_seeded_noise(
                 parameter_infos,
@@ -146,7 +191,6 @@ class SeedReplayModelES:
                 sigma=-float(reverted_perturbation["sigma"]),
             )
             self.active_perturbation = None
-        n_updates = len(self.update_history)
         for item in reversed(self.update_history):
             self._apply_dipu_update(
                 parameter_infos,
@@ -164,12 +208,14 @@ class SeedReplayModelES:
     def status(self) -> Dict[str, Any]:
         parameter_infos = self.parameter_infos or []
         total_params = sum(parameter.numel() for _, _, parameter in parameter_infos)
+        structured_info = self.structured.info() if self.structured is not None else {}
         return {
             "ok": True,
             "initialized": self.parameter_infos is not None,
             "parameter_scope": self.parameter_scope,
             "n_tensors": len(parameter_infos),
-            "total_params": int(total_params),
+            "total_params": int(structured_info.get("total_params", total_params)),
+            **{key: value for key, value in structured_info.items() if key not in {"n_tensors", "total_params"}},
             "update_history": len(self.update_history),
             "active_perturbation": self.active_perturbation,
         }
@@ -186,8 +232,10 @@ class SeedReplayModelES:
     @staticmethod
     def _normalize_parameter_scope(parameter_scope: str) -> str:
         scope = str(parameter_scope or "full").strip().lower()
-        if scope not in {"full", "all_linear", "lora"}:
-            raise ValueError("parameter_scope must be 'full', 'all_linear', or 'lora'.")
+        if scope not in {"full", "all_linear", "lora", *STRUCTURED_SCOPES}:
+            raise ValueError(
+                "parameter_scope must be 'full', 'all_linear', 'lora', 'fura', 'fura_s', 'iso', or 'isobtt'."
+            )
         return scope
 
     @staticmethod
