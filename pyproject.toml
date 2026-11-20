@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esx"
+version = "0.1.0"
+description = "Shared evolution-strategies library: perturbation backends, serving, estimators, run state"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+[project.optional-dependencies]
+serve = ["vllm", "requests"]
+
+[tool.setuptools.packages.find]
+include = ["esx*"]
