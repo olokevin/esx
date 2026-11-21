@@ -32,6 +32,10 @@ runner are patched before load_model, profiling and graph capture. No vLLM plugi
 - ESX_STEER_MAX_TOKENS (65536; >= max_num_batched_tokens).
 - ESX_STEER_CLASSES (comma list of "module:Class"; default below).
 - ESX_STEER_MEASURE=1 (eager only): accumulate the output norm of every steered layer.
+- ESX_STEER_CHECK=1 (tests; syncs every step): audit the token -> slot buffer of every step. (a) Per request, the slot
+  read through the runner's req_index indirection equals the slot of that request's own SamplingParams; (b) the
+  token layout assumed by the patch (batch order, num_scheduled_tokens per request) gives the runner's own positions
+  (as HarnessES's HES_STEER_CHECK). Counts are in esx_steer_debug (check_steps, check_bad_slot, check_bad_pos).
 """
 from __future__ import annotations
 
@@ -45,6 +49,7 @@ LAYERS = sorted({int(x) for x in os.environ.get("ESX_STEER_LAYERS", "").split(",
 SLOTS = int(os.environ.get("ESX_STEER_SLOTS", "65"))
 MAX_TOKENS = int(os.environ.get("ESX_STEER_MAX_TOKENS", "65536"))
 MEASURE = os.environ.get("ESX_STEER_MEASURE") == "1"
+CHECK = os.environ.get("ESX_STEER_CHECK") == "1"
 DEFAULT_CLASSES = ("vllm.model_executor.models.qwen3_5:Qwen3_5DecoderLayer,"
                    "vllm.model_executor.models.qwen3_next:Qwen3NextDecoderLayer,"
                    "vllm.model_executor.models.gemma4:Gemma4DecoderLayer")
@@ -159,6 +164,12 @@ def _write_slots(tok: np.ndarray):
     STATE["calls"] = STATE.get("calls", 0) + 1
 
 
+def _check(bad_slot: bool, bad_pos: bool) -> None:
+    STATE["check_steps"] = STATE.get("check_steps", 0) + 1
+    STATE["check_bad_slot"] = STATE.get("check_bad_slot", 0) + int(bad_slot)
+    STATE["check_bad_pos"] = STATE.get("check_bad_pos", 0) + int(bad_pos)
+
+
 def _patch_v2_runner():
     """vLLM's V2 runner (default in 0.30): requests live at a fixed req_index in req_states; a step's batch maps
     batch position -> req_index (idx_mapping_np) and lays its tokens out in batch order."""
@@ -174,13 +185,22 @@ def _patch_v2_runner():
         slots = STATE.setdefault("req_slot", np.zeros(self.max_num_reqs, dtype=np.int64))
         for new in scheduler_output.scheduled_new_reqs:
             slots[self.req_states.req_id_to_index[new.req_id]] = _slot_of(new.sampling_params)
+            if CHECK:
+                STATE.setdefault("check_req", {})[new.req_id] = _slot_of(new.sampling_params)
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
         out = prepare0(self, scheduler_output, batch_req_state, batch_desc)
         slots = STATE.setdefault("req_slot", np.zeros(self.max_num_reqs, dtype=np.int64))
-        per_req = slots[batch_req_state.idx_mapping_np]
+        idx, n = batch_req_state.idx_mapping_np, batch_req_state.num_scheduled_tokens
+        per_req = slots[idx]
         STATE["last_slots"] = per_req[:16].tolist()
-        _write_slots(np.repeat(per_req, batch_req_state.num_scheduled_tokens))
+        tok = np.repeat(per_req, n)
+        if CHECK:
+            want = np.array([STATE["check_req"][r] for r in batch_req_state.req_ids], dtype=np.int64)
+            start = self.req_states.num_computed_tokens_np[idx].astype(np.int64)
+            pos = np.repeat(start - (np.cumsum(n) - n), n) + np.arange(len(tok))
+            _check(not np.array_equal(want, per_req), not np.array_equal(pos, out.positions[: len(tok)].cpu().numpy()))
+        _write_slots(tok)
         return out
 
     Runner.add_requests, Runner.prepare_inputs, Runner._esx_steer_patched = add_requests, prepare_inputs, True
@@ -199,6 +219,14 @@ def _patch_v1_runner(gpu_model_runner):
         slots = np.array([_slot_of(self.requests[r].sampling_params) for r in self.input_batch.req_ids[:n]],
                          dtype=np.int64)
         STATE["last_slots"] = slots[:16].tolist()
+        if CHECK:  # V1: slots come straight from the requests' SamplingParams; audit the token layout only
+            req = num_scheduled_tokens[:n].astype(np.int64)
+            start = self.input_batch.num_computed_tokens_cpu[:n].astype(np.int64)
+            pos = np.repeat(start - (np.cumsum(req) - req), req) + np.arange(int(req.sum()))
+            ref = getattr(getattr(self, "positions", None), "np", None)
+            if ref is None:
+                ref = getattr(self, "positions_np", None)
+            _check(False, ref is None or not np.array_equal(pos, np.asarray(ref[: len(pos)])))
         _write_slots(np.repeat(slots, num_scheduled_tokens[:n]))
         return out
 

@@ -68,4 +68,5 @@ class SteerWorkerExtension:
     def esx_steer_debug(self):
         idx = _patch.STATE.get("idx")
         return {"idx": None if idx is None else {"device": str(idx.device), "head": idx[:12].tolist()},
-                "last_slots": _patch.STATE.get("last_slots"), "calls": _patch.STATE.get("calls", 0)}
+                "last_slots": _patch.STATE.get("last_slots"), "calls": _patch.STATE.get("calls", 0),
+                **{k: _patch.STATE[k] for k in ("check_steps", "check_bad_slot", "check_bad_pos") if k in _patch.STATE}}
